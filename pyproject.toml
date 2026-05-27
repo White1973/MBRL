@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sembelief-wm"
+version = "0.1.0"
+description = "Semantic belief world model for MBRL-VLM"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy>=1.26,<3",
+    "torch==2.4.1",
+    "Pillow>=10.0",
+    "accelerate>=0.34",
+    "peft>=0.13,<0.17",
+    "safetensors>=0.4",
+    "transformers>=4.49,<4.55",
+    "wandb>=0.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sembelief_wm*"]

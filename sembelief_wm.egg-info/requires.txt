@@ -1,0 +1,14 @@
+gymnasium<1.1,>=0.29
+mani_skill<4,>=3.0.0b22
+minigrid<3,>=2.3
+numpy<3,>=1.26
+torch==2.4.1
+Pillow>=10.0
+accelerate>=0.34
+peft<0.17,>=0.13
+safetensors>=0.4
+transformers<4.55,>=4.49
+wandb>=0.26.0
+
+[dev]
+pytest>=8
