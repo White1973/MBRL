@@ -236,12 +236,118 @@ class BeliefUpdate(nn.Module):
         return BeliefState(slots=next_slots)
 
 
+class PriorResidualAdapter(nn.Module):
+    """Small action-conditioned correction that never runs in posterior_step."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        rank = int(config.training.prior_residual_rank)
+        if rank <= 0:
+            raise ValueError("prior_residual_rank must be positive")
+        self.norm = nn.LayerNorm(config.hidden_dim)
+        self.action_embedding = nn.Embedding(
+            config.env.null_action_id + 1, config.hidden_dim
+        )
+        self.down = nn.Linear(2 * config.hidden_dim, rank)
+        self.up = nn.Linear(rank, config.hidden_dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, belief: BeliefState, actions: Tensor) -> BeliefState:
+        action = self.action_embedding(actions).unsqueeze(1).expand(
+            -1, belief.num_slots, -1
+        )
+        features = torch.cat((self.norm(belief.slots), action), dim=-1)
+        correction = self.up(torch.nn.functional.gelu(self.down(features)))
+        return BeliefState(
+            slots=torch.nn.functional.layer_norm(
+                belief.slots + correction, (belief.hidden_dim,)
+            )
+        )
+
+
+class PriorStateActionAdapter(nn.Module):
+    """Constrained pooled prior update with explicit state-action interaction.
+
+    The adapter predicts only the mean-pooled latent change.  Slot-centred
+    structure still comes from the base transition, preventing the generic
+    per-slot residual from solving auxiliary losses with an action watermark.
+    """
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        rank = int(config.training.prior_residual_rank)
+        if rank <= 0:
+            raise ValueError("prior_residual_rank must be positive")
+        hidden_dim = config.hidden_dim
+        num_actions = config.env.num_actions
+        input_dim = 1 + rank + num_actions + rank * num_actions
+        self.num_actions = num_actions
+        self.register_buffer("pca_mean", torch.zeros(1, hidden_dim))
+        self.register_buffer("pca_basis", torch.zeros(hidden_dim, rank))
+        self.register_buffer("pca_scale", torch.ones(rank))
+        self.register_buffer("artifact_loaded", torch.tensor(False))
+        self.delta = nn.Linear(input_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.delta.weight)
+
+    def load_probe_artifact(self, path: str) -> None:
+        artifact = torch.load(path, map_location="cpu", weights_only=False)
+        report = artifact.get("report", {})
+        if report.get("design_kind") != "interaction":
+            raise ValueError(
+                "PriorStateActionAdapter requires an interaction probe artifact"
+            )
+        state = artifact["state_dict"]
+        expected = self.delta.weight.shape
+        if state["weight"].shape != expected:
+            raise ValueError(
+                f"State-action weight shape {tuple(state['weight'].shape)} "
+                f"does not match {tuple(expected)}"
+            )
+        with torch.no_grad():
+            self.pca_mean.copy_(artifact["pca_mean"])
+            self.pca_basis.copy_(artifact["pca_basis"])
+            self.pca_scale.copy_(artifact["pca_scale"])
+            self.delta.load_state_dict(state)
+            self.artifact_loaded.fill_(True)
+
+    def forward(
+        self,
+        prev_belief: BeliefState,
+        base_prior: BeliefState,
+        actions: Tensor,
+    ) -> BeliefState:
+        if not bool(self.artifact_loaded):
+            raise RuntimeError("PriorStateActionAdapter artifact has not been loaded")
+        state = prev_belief.slots.float().mean(dim=1)
+        projected = (state - self.pca_mean) @ self.pca_basis
+        projected = projected / self.pca_scale.clamp_min(1e-5)
+        onehot = torch.zeros(
+            actions.shape[0], self.num_actions, device=state.device, dtype=state.dtype
+        )
+        valid = (actions >= 0) & (actions < self.num_actions)
+        if valid.any():
+            onehot[valid, actions[valid].long()] = 1.0
+        interaction = (projected[:, :, None] * onehot[:, None, :]).flatten(1)
+        design = torch.cat(
+            (torch.ones_like(projected[:, :1]), projected, onehot, interaction),
+            dim=1,
+        )
+        desired_pool = state + self.delta(design)
+        base_pool = base_prior.slots.float().mean(dim=1)
+        correction = (desired_pool - base_pool).unsqueeze(1)
+        return BeliefState(
+            slots=base_prior.slots + correction.to(dtype=base_prior.slots.dtype)
+        )
+
+
 class TransitionCore(nn.Module):
     """Shared transition core for posterior and prior belief updates."""
 
     def __init__(self, config: Config, backbone: TransitionBackbone) -> None:
         super().__init__()
         self.hidden_dim = config.hidden_dim
+        self.null_action_id = config.env.null_action_id
         self.action_conditioning_mode = config.backbone.action_conditioning_mode
         self.backbone = backbone
         self.token_types = TokenTypeEmbedding(config.hidden_dim)
@@ -255,6 +361,45 @@ class TransitionCore(nn.Module):
                 f"Unsupported action_conditioning_mode: {self.action_conditioning_mode}"
             )
         self.belief_update = BeliefUpdate(config)
+        self.posterior_observation_residual_scale = float(
+            config.training.posterior_observation_residual_scale
+        )
+        self.posterior_grounding_mode = config.training.posterior_grounding_mode
+        self.posterior_recurrent_residual_scale = float(
+            config.training.posterior_recurrent_residual_scale
+        )
+        self.posterior_action_free = bool(config.training.posterior_action_free)
+        self.prior_isolation_mode = config.training.prior_isolation_mode
+        self.prior_lora_adapter_name = config.training.prior_lora_adapter_name
+        if self.prior_isolation_mode == "lora":
+            # Keep posterior grounding on the released ``default`` WM adapter
+            # while giving action-only prediction an independent parameter set.
+            # Checkpoints produced by a prior-repair run contain this adapter;
+            # when converting an older shared-prior checkpoint, train_mbrl copies
+            # the *loaded* default adapter into it before the first update.
+            available = tuple(getattr(backbone, "lora_adapter_names", ()))
+            if self.prior_lora_adapter_name not in available:
+                add_adapter = getattr(backbone, "add_lora_adapter", None)
+                if not callable(add_adapter):
+                    raise TypeError(
+                        "prior_isolation_mode='lora' requires a Qwen backbone "
+                        "that can create an independent prior adapter"
+                    )
+                add_adapter(
+                    self.prior_lora_adapter_name,
+                    initialize_from="default",
+                    lora_dropout=0.0,
+                )
+        self.prior_residual = (
+            PriorResidualAdapter(config)
+            if self.prior_isolation_mode == "residual"
+            else None
+        )
+        self.prior_state_action = (
+            PriorStateActionAdapter(config)
+            if self.prior_isolation_mode == "state_action"
+            else None
+        )
 
     def posterior_step(
         self,
@@ -264,6 +409,8 @@ class TransitionCore(nn.Module):
         env_ids: Tensor | None = None,
     ) -> BeliefState:
         """Compute Z_t from (Z_{t-1}, a_{t-1}, o_t)."""
+        if self.posterior_action_free:
+            prev_actions = torch.full_like(prev_actions, self.null_action_id)
         return self._transition_step(
             prev_belief=prev_belief,
             prev_actions=prev_actions,
@@ -333,7 +480,6 @@ class TransitionCore(nn.Module):
 
         input_segments: list[Tensor] = []
         mask_segments: list[Tensor] = []
-        belief_start_index = 0
 
         if observation_tokens is not None:
             visual_tokens = self._with_token_type(
@@ -342,22 +488,72 @@ class TransitionCore(nn.Module):
             )
             input_segments.append(visual_tokens)
             mask_segments.append(self._full_attention_mask(visual_tokens))
-            belief_start_index = visual_tokens.shape[1]
-
-        input_segments.append(belief_tokens)
-        mask_segments.append(self._full_attention_mask(belief_tokens))
         input_segments.append(action_tokens)
         mask_segments.append(action_mask)
+        belief_start_index = sum(segment.shape[1] for segment in input_segments)
+        input_segments.append(belief_tokens)
+        mask_segments.append(self._full_attention_mask(belief_tokens))
         input_tokens = torch.cat(input_segments, dim=1)
         attention_mask = torch.cat(mask_segments, dim=1)
         input_tokens = self.env_embedding(input_tokens, env_ids)
 
-        hidden = self.backbone(input_tokens, attention_mask=attention_mask)
+        if self.prior_isolation_mode == "lora" and observation_tokens is None:
+            forward_with_adapter = getattr(
+                self.backbone, "forward_with_adapter", None
+            )
+            if not callable(forward_with_adapter):
+                raise TypeError(
+                    "prior_isolation_mode='lora' requires a multi-adapter backbone"
+                )
+            hidden = forward_with_adapter(
+                input_tokens,
+                attention_mask=attention_mask,
+                adapter_name=self.prior_lora_adapter_name,
+            )
+        else:
+            hidden = self.backbone(input_tokens, attention_mask=attention_mask)
         self._validate_hidden(hidden, input_tokens)
 
         belief_end_index = belief_start_index + prev_belief.num_slots
         belief_delta = hidden[:, belief_start_index:belief_end_index, :]
-        return self.belief_update(prev_belief, belief_delta)
+        next_belief = self.belief_update(prev_belief, belief_delta)
+        if (
+            observation_tokens is not None
+            and self.posterior_grounding_mode == "visual_anchor"
+        ):
+            visual_anchor = torch.nn.functional.layer_norm(
+                observation_tokens.float(), (self.hidden_dim,)
+            ).to(dtype=next_belief.slots.dtype)
+            grounded = torch.nn.functional.layer_norm(
+                visual_anchor
+                + self.posterior_recurrent_residual_scale * next_belief.slots,
+                (self.hidden_dim,),
+            )
+            next_belief = BeliefState(slots=grounded)
+        elif (
+            observation_tokens is not None
+            and self.posterior_observation_residual_scale > 0
+        ):
+            # Both tensors are slot aligned. Normalize the frozen V-JEPA
+            # tokens before mixing so the scale is interpretable relative to
+            # the already layer-normalized belief. The prior branch never sees
+            # this residual and must learn to predict its consequence.
+            visual_residual = torch.nn.functional.layer_norm(
+                observation_tokens.float(), (self.hidden_dim,)
+            ).to(dtype=next_belief.slots.dtype)
+            grounded = torch.nn.functional.layer_norm(
+                next_belief.slots
+                + self.posterior_observation_residual_scale * visual_residual,
+                (self.hidden_dim,),
+            )
+            next_belief = BeliefState(slots=grounded)
+        if observation_tokens is None and self.prior_residual is not None:
+            next_belief = self.prior_residual(next_belief, prev_actions)
+        if observation_tokens is None and self.prior_state_action is not None:
+            next_belief = self.prior_state_action(
+                prev_belief, next_belief, prev_actions
+            )
+        return next_belief
 
     def _encode_actions(
         self,
