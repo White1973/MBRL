@@ -8,14 +8,19 @@ version = "0.1.0"
 description = "Semantic belief world model for MBRL-VLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "gymnasium>=0.29,<1.1",
+    "mani_skill>=3.0.0b22,<4",
+    "minigrid>=2.3,<3",
     "numpy>=1.26,<3",
-    "torch==2.4.1",
+    "torch==2.8.0",
     "Pillow>=10.0",
     "accelerate>=0.34",
     "peft>=0.13,<0.17",
     "safetensors>=0.4",
-    "transformers>=4.49,<4.55",
+    "transformers>=4.49,<=4.57",
     "wandb>=0.26.0",
+    "gym-sokoban==0.0.6",
+    "setuptools<81",
 ]
 
 [project.optional-dependencies]
