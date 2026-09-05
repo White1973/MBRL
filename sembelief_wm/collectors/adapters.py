@@ -67,15 +67,23 @@ class LatentActorCriticAdapter:
         return BeliefState(slots=states)
 
 
-def make_dynamics_step(world_model: Any):
+def make_dynamics_step(world_model: Any, *, action_id_offset: int = 0):
     """Create a dynamics_step callable from a WorldModel instance.
 
     Returns a function: (belief, action, **kwargs) -> next_belief
+
+    ``action_id_offset=1`` is a compatibility shim for legacy Sokoban WM
+    checkpoints trained from tokenized environment action ids 1..4. Policy
+    actions remain canonical 0..3 everywhere else, including real evaluation.
     """
+    if action_id_offset < 0:
+        raise ValueError("action_id_offset must be non-negative")
+
     def dynamics_step(belief: Any, action: Tensor, **kwargs: Any) -> Any:
+        wm_action = action + action_id_offset
         return world_model.prior_step(
             prev_belief=belief,
-            prev_actions=action,
+            prev_actions=wm_action,
             **kwargs,
         )
     return dynamics_step
