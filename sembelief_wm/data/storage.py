@@ -126,6 +126,11 @@ def save_tokenized_episode(
             "env_id": episode.env_id,
             "tokenizer": tokenizer,
             "token_shape": list(episode.obs_tokens.shape),
+            "semantic_teacher_shape": (
+                None
+                if episode.semantic_teacher_tokens is None
+                else list(episode.semantic_teacher_tokens.shape)
+            ),
             "length": int(episode.episode_length),
             "split": episode.split,
             "config_hash": config_hash,
