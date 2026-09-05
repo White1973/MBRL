@@ -1217,6 +1217,21 @@ class Phase2Trainer:
             rewards=batch.rewards.to(self.device),
             episode_lengths=batch.episode_lengths.to(self.device),
             env_ids=None if batch.env_ids is None else batch.env_ids.to(self.device),
+            episode_success=(
+                None
+                if batch.episode_success is None
+                else batch.episode_success.to(self.device)
+            ),
+            semantic_teacher_tokens=(
+                None
+                if batch.semantic_teacher_tokens is None
+                else batch.semantic_teacher_tokens.to(self.device)
+            ),
+            semantic_teacher_mask=(
+                None
+                if batch.semantic_teacher_mask is None
+                else batch.semantic_teacher_mask.to(self.device)
+            ),
         )
 
     @staticmethod
