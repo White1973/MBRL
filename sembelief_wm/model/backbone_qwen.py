@@ -7,6 +7,7 @@ CPU smoke path can still import the package without the VLM extras installed.
 """
 from __future__ import annotations
 
+import copy
 import inspect
 from typing import Any, Literal
 
@@ -18,6 +19,7 @@ from .transition import TransitionBackbone
 
 
 QwenDType = Literal["bf16", "fp32"]
+WM_LORA_ADAPTER = "default"
 
 
 def training_dtype(name: QwenDType) -> torch.dtype:
@@ -30,13 +32,33 @@ def training_dtype(name: QwenDType) -> torch.dtype:
     raise ValueError(f"Unsupported training dtype: {name}")
 
 
+def _resolve_attention_implementation(
+    *,
+    attention_mode: str,
+    requested: str | None,
+) -> str | None:
+    """Choose a backend compatible with the configured attention semantics.
+
+    FlashAttention2 only accepts its specialized 2-D padding/varlen masks. It
+    cannot consume the explicit 4-D additive mask required to bypass Qwen's
+    internally-created causal mask. SDPA supports that mask and still uses
+    fused CUDA kernels where possible.
+    """
+    if attention_mode == "bidirectional" and requested not in {"sdpa", "eager"}:
+        return "sdpa"
+    return requested
+
+
 class QwenTransitionBackbone(TransitionBackbone):
     """Qwen2.5-VL language backbone adapted to token-to-token transitions.
 
     The wrapper accepts already embedded world-model tokens `(B, S, D)` via
     `inputs_embeds` and returns the final hidden states with the same shape.
-    Visual preprocessing from the original Qwen-VL stack is intentionally not
-    used; observations enter the world model as V-JEPA-derived tokens.
+    Native Qwen visual preprocessing happens once in ``QwenVisionTokenizer``
+    and its image embeddings are supplied here as ``inputs_embeds``. Keeping
+    extraction outside the recurrent transition avoids re-running the vision
+    tower at every BPTT step while retaining Qwen2.5-VL—not V-JEPA—as the
+    observation representation.
     """
 
     def __init__(
@@ -52,9 +74,24 @@ class QwenTransitionBackbone(TransitionBackbone):
         self.model = model
         self.tokenizer = tokenizer
         self.transformer = _inner_transformer(model)
+        # Keep ``transformer`` registered exactly as in historical
+        # checkpoints. The mask-aware decoder is only a non-owning execution
+        # reference; registering the inner language model here would rename
+        # thousands of state-dict keys and break Phase-1/Phase-2 checkpoints.
+        object.__setattr__(
+            self,
+            "_forward_transformer",
+            _mask_aware_transformer(self.transformer),
+        )
         self.hidden_dim = hidden_dim
         self.compute_dtype = compute_dtype
         self.attention_mode = attention_mode
+        self._lora_parameter_cache: dict[
+            str, list[torch.nn.Parameter]
+        ] = {}
+        self._all_lora_parameter_cache: list[
+            torch.nn.Parameter
+        ] | None = None
 
         if attention_mode == "bidirectional":
             _patch_bidirectional_attention(self.transformer)
@@ -78,6 +115,10 @@ class QwenTransitionBackbone(TransitionBackbone):
         # Use config-level attn_implementation if caller didn't override
         if attn_implementation is None:
             attn_implementation = config.backbone.attn_implementation
+        attn_implementation = _resolve_attention_implementation(
+            attention_mode=config.backbone.attention_mode,
+            requested=attn_implementation,
+        )
 
         model_kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
@@ -113,7 +154,14 @@ class QwenTransitionBackbone(TransitionBackbone):
             bias="none",
             task_type=_lora_task_type(peft),
         )
-        model = peft.get_peft_model(model, lora_config)
+        # Keep the historical ``default`` name for Phase-1 checkpoint
+        # compatibility. Phase 2 adds actor/critic adapters to this same PEFT
+        # container instead of loading additional Qwen base models.
+        model = peft.get_peft_model(
+            model,
+            lora_config,
+            adapter_name=WM_LORA_ADAPTER,
+        )
         model.config.use_cache = False
 
         # Gradient checkpointing: recompute activations to save ~40-60 GB VRAM
@@ -129,7 +177,174 @@ class QwenTransitionBackbone(TransitionBackbone):
             attention_mode=config.backbone.attention_mode,
         )
 
+    @property
+    def lora_adapter_names(self) -> tuple[str, ...]:
+        configs = getattr(self.model, "peft_config", {})
+        return tuple(configs.keys())
+
+    def add_lora_adapter(
+        self,
+        adapter_name: str,
+        *,
+        initialize_from: str = WM_LORA_ADAPTER,
+        lora_dropout: float | None = None,
+    ) -> None:
+        """Add an independent LoRA set while retaining one frozen Qwen base.
+
+        Phase-2 policy adapters use ``lora_dropout=0``. PPO requires the old
+        and current policy log probabilities to be comparable, while active
+        LoRA dropout otherwise makes an unchanged actor look as if it already
+        moved. The adapter remains fully trainable; only stochastic masking is
+        disabled.
+        """
+        configs = getattr(self.model, "peft_config", None)
+        add_adapter = getattr(self.model, "add_adapter", None)
+        if configs is None or not callable(add_adapter):
+            raise TypeError("Qwen backbone is not a multi-adapter PEFT model")
+        if adapter_name in configs:
+            raise ValueError(f"LoRA adapter already exists: {adapter_name!r}")
+        if initialize_from not in configs:
+            raise ValueError(
+                f"Cannot initialize {adapter_name!r}: source adapter "
+                f"{initialize_from!r} does not exist"
+            )
+
+        # PEFT state helpers normalize away the source adapter name, allowing
+        # the same tensors to be installed under the new destination name.
+        from peft import (  # type: ignore[import-not-found]
+            get_peft_model_state_dict,
+            set_peft_model_state_dict,
+        )
+
+        source_state = get_peft_model_state_dict(
+            self.model,
+            adapter_name=initialize_from,
+        )
+        adapter_config = copy.deepcopy(configs[initialize_from])
+        if lora_dropout is not None:
+            if not 0.0 <= lora_dropout < 1.0:
+                raise ValueError("lora_dropout must be in [0, 1)")
+            adapter_config.lora_dropout = float(lora_dropout)
+        add_adapter(adapter_name, adapter_config)
+        set_peft_model_state_dict(
+            self.model,
+            source_state,
+            adapter_name=adapter_name,
+        )
+        self._lora_parameter_cache = {}
+        self._all_lora_parameter_cache = None
+        # Adding an adapter must not implicitly alter the Phase-1 ownership
+        # mask. Assembly explicitly enables only the PPO-owned adapter params.
+        self.set_lora_adapter_trainable(adapter_name, False)
+
+    def copy_lora_adapter(self, source: str, destination: str) -> None:
+        """Copy adapter tensors after loading a legacy single-adapter model."""
+        configs = getattr(self.model, "peft_config", {})
+        if source not in configs or destination not in configs:
+            raise ValueError(
+                f"Cannot copy LoRA adapter {source!r}->{destination!r}; "
+                f"available={tuple(configs)}"
+            )
+        from peft import (  # type: ignore[import-not-found]
+            get_peft_model_state_dict,
+            set_peft_model_state_dict,
+        )
+        state = get_peft_model_state_dict(self.model, adapter_name=source)
+        set_peft_model_state_dict(
+            self.model, state, adapter_name=destination
+        )
+
+    def lora_adapter_parameters(
+        self,
+        adapter_name: str,
+    ) -> list[torch.nn.Parameter]:
+        if adapter_name not in self.lora_adapter_names:
+            raise ValueError(f"Unknown LoRA adapter: {adapter_name!r}")
+        cache = getattr(self, "_lora_parameter_cache", None)
+        if cache is None:
+            cache = {}
+            self._lora_parameter_cache = cache
+        if adapter_name in cache:
+            return list(cache[adapter_name])
+        marker = f".{adapter_name}."
+        parameters = [
+            parameter
+            for name, parameter in self.model.named_parameters()
+            if "lora_" in name.lower() and marker in name
+        ]
+        if not parameters:
+            raise RuntimeError(
+                f"PEFT adapter {adapter_name!r} has no LoRA parameters"
+            )
+        cache[adapter_name] = parameters
+        return list(parameters)
+
+    def _all_lora_parameters(self) -> list[torch.nn.Parameter]:
+        cached = getattr(self, "_all_lora_parameter_cache", None)
+        if cached is not None:
+            return list(cached)
+        parameters: list[torch.nn.Parameter] = []
+        seen: set[int] = set()
+        for adapter_name in self.lora_adapter_names:
+            for parameter in self.lora_adapter_parameters(adapter_name):
+                if id(parameter) not in seen:
+                    parameters.append(parameter)
+                    seen.add(id(parameter))
+        self._all_lora_parameter_cache = parameters
+        return list(parameters)
+
+    def set_lora_adapter_trainable(
+        self,
+        adapter_name: str,
+        trainable: bool,
+    ) -> None:
+        for parameter in self.lora_adapter_parameters(adapter_name):
+            parameter.requires_grad_(trainable)
+
+    def _activate_lora_adapter(self, adapter_name: str) -> None:
+        """Select an adapter without letting PEFT mutate ownership masks.
+
+        ``PeftModel.set_adapter`` makes the selected adapter trainable as a
+        side effect. That is unsafe for frozen WM rollouts and frozen_vlm
+        branches, so preserve every adapter's current requires-grad state.
+        """
+        set_adapter = getattr(self.model, "set_adapter", None)
+        if not callable(set_adapter):
+            raise TypeError("Qwen backbone does not support PEFT adapters")
+        adapter_parameters = self._all_lora_parameters()
+        trainability = [
+            parameter.requires_grad for parameter in adapter_parameters
+        ]
+        set_adapter(adapter_name)
+        for parameter, requires_grad in zip(
+            adapter_parameters,
+            trainability,
+            strict=True,
+        ):
+            parameter.requires_grad_(requires_grad)
+
+    def forward_with_adapter(
+        self,
+        tokens: Tensor,
+        attention_mask: Tensor | None = None,
+        *,
+        adapter_name: str,
+    ) -> Tensor:
+        self._activate_lora_adapter(adapter_name)
+        return self._forward_hidden(tokens, attention_mask=attention_mask)
+
     def forward(self, tokens: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        return self.forward_with_adapter(
+            tokens,
+            attention_mask=attention_mask,
+            adapter_name=WM_LORA_ADAPTER,
+        )
+
+    def _forward_hidden(
+        self,
+        tokens: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
         if tokens.ndim != 3:
             raise ValueError(
                 f"QwenTransitionBackbone expects tokens with shape (B, S, D), got {tuple(tokens.shape)}."
@@ -153,9 +368,25 @@ class QwenTransitionBackbone(TransitionBackbone):
             )
         else:
             attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=torch.long)
-        outputs = self.transformer(
+        transformer_attention_mask: Tensor | dict[str, Tensor]
+        if self.attention_mode == "bidirectional":
+            # Qwen2.5-VL 4.54 constructs a causal 4-D mask inside the text
+            # model whenever it receives a conventional 2-D padding mask.
+            # Flipping ``self_attn.is_causal`` is therefore insufficient: the
+            # already-created additive mask still prevents an earlier belief
+            # token from attending to the action tokens appended after it.
+            # Passing the mask mapping expected by Qwen bypasses that internal
+            # causal-mask construction and makes the configured attention mode
+            # real rather than cosmetic.
+            transformer_attention_mask = _bidirectional_mask_mapping(
+                attention_mask,
+                dtype=inputs_embeds.dtype,
+            )
+        else:
+            transformer_attention_mask = attention_mask
+        outputs = self._forward_transformer(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=transformer_attention_mask,
             use_cache=False,
             return_dict=True,
         )
@@ -307,6 +538,14 @@ def _inner_transformer(model: torch.nn.Module) -> torch.nn.Module:
     )
 
 
+def _mask_aware_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
+    """Select Qwen's decoder while preserving historical module ownership."""
+    language_model = getattr(transformer, "language_model", None)
+    if isinstance(language_model, torch.nn.Module):
+        return language_model
+    return transformer
+
+
 def _looks_like_hidden_transformer(module: torch.nn.Module) -> bool:
     try:
         signature = inspect.signature(module.forward)
@@ -348,6 +587,41 @@ def _patch_bidirectional_attention(module: torch.nn.Module) -> None:
                 setattr(config, "is_causal", False)
             except Exception:
                 pass
+
+
+def _bidirectional_mask_mapping(
+    attention_mask: Tensor,
+    *,
+    dtype: torch.dtype,
+) -> dict[str, Tensor]:
+    """Build Qwen's explicit non-causal additive attention masks.
+
+    The returned tensors have shape ``(B, 1, Q, K)``. Every non-padding query
+    can attend to every non-padding key, including keys to its right. Qwen's
+    text model accepts a mapping directly and consequently skips
+    ``create_causal_mask``. Both keys are supplied because Qwen2.5-VL may mix
+    full- and sliding-attention decoder layers.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "Bidirectional Qwen attention expects a 2-D padding mask, got "
+            f"shape {tuple(attention_mask.shape)}"
+        )
+    batch_size, seq_len = attention_mask.shape
+    valid_keys = attention_mask.to(dtype=torch.bool)[:, None, None, :]
+    additive = torch.zeros(
+        batch_size,
+        1,
+        seq_len,
+        seq_len,
+        dtype=dtype,
+        device=attention_mask.device,
+    )
+    additive.masked_fill_(~valid_keys, torch.finfo(dtype).min)
+    return {
+        "full_attention": additive,
+        "sliding_attention": additive,
+    }
 
 
 def _last_hidden_state(outputs: Any) -> Tensor:
