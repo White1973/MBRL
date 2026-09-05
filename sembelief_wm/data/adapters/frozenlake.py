@@ -11,6 +11,9 @@ This adapter supports two strategies:
 from __future__ import annotations
 
 from typing import Any
+import importlib.util
+import os
+from pathlib import Path
 
 import numpy as np
 
@@ -34,7 +37,7 @@ LEFT, DOWN, RIGHT, UP = 0, 1, 2, 3
 
 
 class FrozenLakeEnv:
-    """Deterministic FrozenLake 4x4 without gymnasium dependency."""
+    """Synchronous RGB environment with VAGEN-equivalent Gym mechanics."""
 
     def __init__(self, lake_map: list[str] | None = None, seed: int | None = None) -> None:
         self.map = lake_map or _DEFAULT_MAP
@@ -43,7 +46,9 @@ class FrozenLakeEnv:
         self.n_states = self.nrow * self.ncol
         self.n_actions = 4
         self._rng = np.random.default_rng(seed)
-        self.state = 0
+        from gymnasium.envs.toy_text.frozen_lake import FrozenLakeEnv as GymFrozenLakeEnv
+        self.state = "".join(self.map).index("S")
+        self._env = GymFrozenLakeEnv(desc=self.map, is_slippery=False, render_mode="rgb_array")
 
         # Precompute goal and hole positions
         self._goals: set[int] = set()
@@ -56,30 +61,28 @@ class FrozenLakeEnv:
                 elif ch == "H":
                     self._holes.add(s)
 
-    def reset(self, *, seed: int | None = None) -> int:
+    def _render(self) -> np.ndarray:
+        frame = self._env.render()
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3:
+            raise RuntimeError("FrozenLake renderer did not return an RGB array")
+        return frame
+
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
-        self.state = 0
-        return self.state
+        state, _ = self._env.reset(seed=seed); self.state = int(state)
+        return self._render()
 
-    def step(self, action: int) -> tuple[int, float, bool, dict[str, Any]]:
-        row, col = divmod(self.state, self.ncol)
-        if action == LEFT:
-            col = max(col - 1, 0)
-        elif action == DOWN:
-            row = min(row + 1, self.nrow - 1)
-        elif action == RIGHT:
-            col = min(col + 1, self.ncol - 1)
-        elif action == UP:
-            row = max(row - 1, 0)
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
+        state, reward, terminated, truncated, _ = self._env.step(int(action))
+        self.state = int(state); done = bool(terminated or truncated)
+        return self._render(), float(reward), done, {
+            "success": bool(done and self.state in self._goals)
+        }
 
-        self.state = row * self.ncol + col
-
-        if self.state in self._goals:
-            return self.state, 1.0, True, {"success": True}
-        if self.state in self._holes:
-            return self.state, 0.0, True, {"success": False}
-        return self.state, 0.0, False, {}
+    def get_initial_metadata(self) -> dict[str, Any]:
+        return {"map_rows": list(self.map), "start_state": "".join(self.map).index("S"),
+                "goal_state": "".join(self.map).index("G")}
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +102,11 @@ class ValueIterationExpert:
     """Optimal policy via value iteration on the deterministic FrozenLake."""
 
     def __init__(self, env: FrozenLakeEnv) -> None:
+        self._env = env
         self._policy = self._solve(env)
 
     def __call__(self, observation: Observation) -> int:
-        return self._policy.get(int(observation), 0)
+        return self._policy.get(self._env.state, 0)
 
     @staticmethod
     def _solve(env: FrozenLakeEnv, gamma: float = 0.99, n_iters: int = 200) -> dict[int, int]:
@@ -159,25 +163,35 @@ class ValueIterationExpert:
 # ---------------------------------------------------------------------------
 
 class FrozenLakeAdapter:
-    """EnvironmentAdapter implementation for FrozenLake 4x4."""
+    """VAGEN FrozenLake environment adapter for the shared Qwen MBRL stack."""
 
     env_id: str = "frozenlake"
 
-    def __init__(self, lake_map: list[str] | None = None) -> None:
-        self._lake_map = lake_map or _DEFAULT_MAP
-        self._n_states = len(self._lake_map) * len(self._lake_map[0])
+    def __init__(self, lake_map: list[str] | None = None, *, size: int = 4,
+                 p: float = 0.8, vagen_root: str | Path | None = None) -> None:
+        self._lake_map = lake_map; self._size = size; self._p = p
+        root = Path(vagen_root or os.environ.get("VAGEN_ROOT", "/personal/jiayu2026/code/VAGEN-new"))
+        source = root / "vagen/envs/frozenlake/utils/utils.py"
+        spec = importlib.util.spec_from_file_location("mbrl_vagen_frozenlake_utils", source)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load VAGEN generator: {source}")
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        self._generate_random_map = module.generate_random_map
 
     def make_env(self, seed: int | None = None) -> EnvProtocol:
-        return FrozenLakeEnv(lake_map=self._lake_map, seed=seed)
+        lake_map = self._lake_map or self._generate_random_map(
+            size=self._size, p=self._p, seed=seed
+        )
+        return FrozenLakeEnv(lake_map=list(lake_map), seed=seed)
 
     def action_spec(self) -> ActionSpaceSpec:
         return ActionSpaceSpec(type="discrete", num_actions=4)
 
     def observation_spec(self) -> ObservationSpaceSpec:
         return ObservationSpaceSpec(
-            modality="discrete_state",
-            shape=(self._n_states,),
-            dtype="int64",
+            modality="rgb",
+            shape=None,
+            dtype="uint8",
         )
 
     def available_strategies(self) -> list[str]:
