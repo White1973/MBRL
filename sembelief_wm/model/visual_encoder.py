@@ -1,6 +1,6 @@
-"""Visual-token preprocessing utilities for SemBelief-WM.
+"""Legacy V-JEPA visual-token preprocessing utilities for SemBelief-WM.
 
-The world-model training stack consumes precomputed observation tokens with
+The legacy V-JEPA-input world-model stack consumes precomputed observation tokens with
 shape (B, K_vis, D). This module owns the lightweight, testable part of that
 offline preprocessing path:
 
@@ -8,8 +8,9 @@ offline preprocessing path:
         -> token compression (B, 36, 1408)
         -> projection (B, 36, D)
 
-The concrete V-JEPA 2 model wrapper is intentionally left outside this module
-until the remote dependency/API surface is verified.
+The Qwen-native recipe does not use this projection as WM input. It keeps
+V-JEPA only as a frozen semantic teacher stored beside Qwen observation
+tokens. This module remains for legacy checkpoints and the V-JEPA ablation.
 """
 from __future__ import annotations
 
