@@ -124,6 +124,16 @@ class SequenceBatch:
     rewards: Tensor      # (B, T) float — raw environment rewards
     episode_lengths: Tensor  # (B,) int64 — valid length of each episode
     env_ids: Tensor | None = None  # (B,) int64 — environment id index for multi-env WM
+    # Per-episode terminal-success label (1 if the episode reached success,
+    # 0 otherwise). Carried into training windows for the terminal-step
+    # auxiliary reward BCE so the reward head gets a clean success/failure
+    # signal instead of the all-negative-window-diluted per-step label.
+    episode_success: Tensor | None = None  # (B,) float32
+    # Optional frozen V-JEPA spatial-semantic targets. These are intentionally
+    # not aliases of obs_tokens: Qwen tokens condition the WM, while V-JEPA
+    # tokens supervise the predicted future belief.
+    semantic_teacher_tokens: Tensor | None = None  # (B, T, K_teacher, D_teacher)
+    semantic_teacher_mask: Tensor | None = None    # (B, T) bool
 
     @property
     def batch_size(self) -> int:
@@ -146,6 +156,7 @@ class TrainingWindow:
         prev_rewards: (B,)         where prev_rewards[b] = r_{t0-1} for window start
         has_prev_reward: (B,)      whether prev_rewards is a valid label for step 0
         valid_lengths: (B,)        number of valid posterior timesteps inside the window
+        terminal_mask: (B,)        whether this window contains the episode-terminal posterior
         prev_belief: BeliefState   belief carried into the window start
         start_index: int           global time index of the window start
         is_initial_window: bool    whether this window starts at t=0
@@ -169,10 +180,21 @@ class TrainingWindow:
     prev_rewards: Tensor     # (B,) float
     has_prev_reward: Tensor  # (B,) bool
     valid_lengths: Tensor    # (B,) int64 — valid length within this window
+    terminal_mask: Tensor    # (B,) bool — window contains Z_T for this episode
     prev_belief: BeliefState
     start_index: int
     is_initial_window: bool
     env_ids: Tensor | None = None  # (B,) int64
+    # Retained for episode-level metrics/backward compatibility. Reward-head
+    # supervision must use the aligned per-transition rewards, not this label.
+    episode_success: Tensor | None = None  # (B,) float32
+    semantic_teacher_tokens: Tensor | None = None  # (B, H, K_teacher, D_teacher)
+    semantic_teacher_mask: Tensor | None = None    # (B, H) bool
+    # Teacher target and availability for the state immediately before the
+    # window. These make the first transition of every noninitial BPTT window
+    # eligible for semantic-delta supervision.
+    prev_semantic_teacher_tokens: Tensor | None = None  # (B, K_teacher, D_teacher)
+    prev_semantic_teacher_mask: Tensor | None = None    # (B,) bool
 
     @property
     def batch_size(self) -> int:
