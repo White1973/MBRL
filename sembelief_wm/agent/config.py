@@ -183,9 +183,20 @@ class PPOConfig:
     value_coef: float = 0.5
     entropy_coef: float = 0.5
     kl_coef: float = 0.0               # KL penalty against old policy (0 = disabled)
+    target_kl: float | None = None
     max_grad_norm: float = 0.5
     normalize_advantages: bool = False
-    reward_mapping: Literal["sigmoid_affine", "raw_sigmoid", "clipped_logit"] = "raw_sigmoid"  # raw_sigmoid := sigmoid(logit) - 0.5
+    reward_mapping: Literal[
+        "sigmoid_affine",
+        "raw_sigmoid",
+        "clipped_logit",
+        "terminal_success",
+        "terminal_success_scaled",
+        "terminal_success_conservative",
+    ] = "raw_sigmoid"
+    reward_scale: float = 1.0
+    reward_confidence_floor: float = 0.5
+    reward_low_confidence_scale: float = 0.1
     checkpoint_every: int = 100
     eval_every: int = 50                 # run real-env eval every N updates (0 = disabled)
     eval_episodes: int = 20              # episodes per eval round
@@ -216,6 +227,10 @@ class WorldModelRefreshConfig:
     warmup_steps: int = 100
     grad_clip: float = 1.0
     horizon: int = 8                     # fixed BPTT horizon for WM refresh
+    reward_pos_weight: float | None = None
+    reward_loss_coef: float | None = None
+    freeze_reward_head: bool = False
+    validation_batches: int = 0
 
 
 @dataclass
