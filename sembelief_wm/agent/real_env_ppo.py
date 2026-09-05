@@ -842,6 +842,22 @@ def compute_gae_with_dones(
     return advantages, returns
 
 
+def compute_gae_with_termination(
+    rewards: Tensor, values: Tensor, terminated: Tensor, truncated: Tensor, *,
+    gamma: float, gae_lambda: float,
+) -> tuple[Tensor, Tensor]:
+    """GAE that bootstraps time-limit truncations but not true terminals."""
+    advantages = torch.zeros_like(rewards)
+    next_advantage = torch.tensor(0.0, device=rewards.device, dtype=rewards.dtype)
+    for index in range(len(rewards) - 1, -1, -1):
+        bootstrap_mask = 1.0 - terminated[index]
+        boundary_mask = 1.0 - torch.maximum(terminated[index], truncated[index])
+        delta = rewards[index] + gamma * values[index + 1] * bootstrap_mask - values[index]
+        next_advantage = delta + gamma * gae_lambda * boundary_mask * next_advantage
+        advantages[index] = next_advantage
+    return advantages, advantages + values[:-1]
+
+
 class RealEnvPPOTrainer:
     """PPO trainer for raw-RGB freeform VLM policies in the real environment."""
 
@@ -914,6 +930,8 @@ class RealEnvPPOTrainer:
         actions: list[Tensor] = []
         rewards: list[float] = []
         dones: list[float] = []
+        terminated_flags: list[float] = []
+        truncated_flags: list[float] = []
         values: list[float] = []
         response_token_ids: list[Tensor] = []
         response_masks: list[Tensor] = []
@@ -957,7 +975,12 @@ class RealEnvPPOTrainer:
                     env_ids_list.append(env_id)
                     actions.append(step.actions[0].detach().cpu())
                     rewards.append(float(reward))
-                    dones.append(float(done))
+                    success = bool(_info.get("success", False) or _info.get("all_boxes_on_target", False))
+                    time_limit = bool(done and not success)
+                    collector_limit = bool((step_idx + 1) >= max_steps and not success)
+                    terminated_flags.append(float(success))
+                    truncated_flags.append(float(time_limit or collector_limit))
+                    dones.append(float(success or time_limit or collector_limit))
                     values.append(float(step.values[0].item()))
                     response_token_ids.append(step.response_token_ids[0].detach().cpu())
                     response_masks.append(step.response_mask[0].detach().cpu())
@@ -974,7 +997,15 @@ class RealEnvPPOTrainer:
                     turn_history.append({"response": step.raw_texts[0], "action": action_text})
                     obs = next_obs
                     step_idx += 1
-                bootstrap_values.append(0.0)
+                if terminated_flags and terminated_flags[-1] and trajectory_ids[-1] == episode_idx:
+                    bootstrap_values.append(0.0)
+                else:
+                    final_prompt = self._build_single_turn_prompt(obs, turn_history)
+                    final = self.policy.act(
+                        [obs], torch.tensor([env_id], device=self.device),
+                        deterministic=True, prompt_texts=[final_prompt],
+                    )
+                    bootstrap_values.append(float(final.values[0].item()))
             finally:
                 close = getattr(env, "close", None)
                 if callable(close):
@@ -983,12 +1014,14 @@ class RealEnvPPOTrainer:
 
         rewards_t = torch.tensor(rewards, device=self.device, dtype=torch.float32)
         dones_t = torch.tensor(dones, device=self.device, dtype=torch.float32)
+        terminated_t = torch.tensor(terminated_flags, device=self.device, dtype=torch.float32)
+        truncated_t = torch.tensor(truncated_flags, device=self.device, dtype=torch.float32)
         values_t = torch.tensor(values + bootstrap_values[:1], device=self.device, dtype=torch.float32)
-        values_ext = self._expand_bootstrap_values(values_t, trajectory_ids, values)
-        advantages, returns = compute_gae_with_dones(
+        values_ext = self._expand_bootstrap_values(values_t, trajectory_ids, values, bootstrap_values)
+        advantages, returns = compute_gae_with_termination(
             rewards_t,
             values_ext,
-            dones_t,
+            terminated_t, truncated_t,
             gamma=self.config.phase2.ppo.gamma,
             gae_lambda=self.config.phase2.ppo.gae_lambda,
         )
@@ -1291,8 +1324,8 @@ class RealEnvPPOTrainer:
         )
 
     @staticmethod
-    def _expand_bootstrap_values(values_t: Tensor, trajectory_ids: list[int], values: list[float]) -> Tensor:
-        # Build per-step next values with terminal bootstrap fixed at zero.
+    def _expand_bootstrap_values(values_t: Tensor, trajectory_ids: list[int], values: list[float], bootstrap_values: list[float] | None = None) -> Tensor:
+        # Build per-step next values; boundary values may bootstrap truncations.
         n = len(values)
         out = torch.zeros(n + 1, device=values_t.device, dtype=values_t.dtype)
         out[:n] = values_t[:-1]
@@ -1300,7 +1333,8 @@ class RealEnvPPOTrainer:
             if i + 1 < n and trajectory_ids[i + 1] == trajectory_ids[i]:
                 out[i + 1] = values_t[i + 1]
             else:
-                out[i + 1] = 0.0
+                trajectory = trajectory_ids[i]
+                out[i + 1] = 0.0 if bootstrap_values is None else bootstrap_values[trajectory]
         return out
 
     def _adapter(self) -> EnvironmentAdapter:
