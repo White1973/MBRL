@@ -103,6 +103,9 @@ class TokenizedEpisode:
     reward entries are dummy padding so the trainer can keep a shared time axis.
     """
 
+    # Native Qwen2.5-VL visual embeddings used to condition the posterior.
+    # They are deliberately separate from ``semantic_teacher_tokens`` below:
+    # the latter are frozen V-JEPA targets, never an input to the transition.
     obs_tokens: Tensor
     actions: Tensor
     rewards: Tensor
@@ -110,6 +113,10 @@ class TokenizedEpisode:
     env_id: str
     split: str = "train"
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional frozen V-JEPA feature grid with shape (T, K_teacher, D_teacher).
+    # A paired dataset stores this alongside Qwen obs_tokens so that the WM can
+    # be trained without loading V-JEPA in the optimization process.
+    semantic_teacher_tokens: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.obs_tokens.ndim != 3:
@@ -121,6 +128,16 @@ class TokenizedEpisode:
             raise ValueError("TokenizedEpisode actions and obs_tokens must share T.")
         if self.rewards.shape[0] != self.obs_tokens.shape[0]:
             raise ValueError("TokenizedEpisode rewards and obs_tokens must share T.")
+        if self.semantic_teacher_tokens is not None:
+            if self.semantic_teacher_tokens.ndim != 3:
+                raise ValueError(
+                    "semantic_teacher_tokens must have shape (T, K, D), got "
+                    f"{tuple(self.semantic_teacher_tokens.shape)}."
+                )
+            if self.semantic_teacher_tokens.shape[0] != self.obs_tokens.shape[0]:
+                raise ValueError(
+                    "semantic_teacher_tokens and obs_tokens must share T."
+                )
         if not 0 < self.episode_length <= self.obs_tokens.shape[0]:
             raise ValueError(
                 "episode_length must be within token sequence length, got "
@@ -175,6 +192,11 @@ def episode_to_dict(episode: TokenizedEpisode) -> dict[str, Any]:
         "env_id": episode.env_id,
         "split": episode.split,
         "metadata": episode.metadata,
+        "semantic_teacher_tokens": (
+            None
+            if episode.semantic_teacher_tokens is None
+            else episode.semantic_teacher_tokens.detach().cpu()
+        ),
     }
 
 
@@ -189,4 +211,9 @@ def episode_from_dict(data: dict[str, Any]) -> TokenizedEpisode:
         env_id=str(data["env_id"]),
         split=str(data.get("split", "train")),
         metadata=dict(data.get("metadata", {})),
+        semantic_teacher_tokens=(
+            None
+            if data.get("semantic_teacher_tokens") is None
+            else torch.as_tensor(data["semantic_teacher_tokens"])
+        ),
     )
