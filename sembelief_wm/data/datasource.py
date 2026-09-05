@@ -188,6 +188,37 @@ class OfflineDataSource:
         rewards = torch.zeros(batch_size, max_seq_len, dtype=torch.float32)
         env_ids = torch.zeros(batch_size, dtype=torch.long)
         episode_lengths = torch.tensor(t_seqs, dtype=torch.long)
+        episode_success = torch.zeros(batch_size, dtype=torch.float32)
+
+        teacher_shape: tuple[int, int] | None = None
+        for episode in episodes:
+            if episode.semantic_teacher_tokens is not None:
+                candidate = tuple(episode.semantic_teacher_tokens.shape[1:])
+                if teacher_shape is None:
+                    teacher_shape = candidate
+                elif candidate != teacher_shape:
+                    raise ValueError(
+                        "All semantic teacher grids in a batch must share "
+                        f"(K, D), got {teacher_shape} and {candidate}."
+                    )
+        semantic_teacher_tokens: Tensor | None = None
+        semantic_teacher_mask: Tensor | None = None
+        if teacher_shape is not None:
+            teacher_k, teacher_d = teacher_shape
+            semantic_teacher_tokens = torch.zeros(
+                batch_size,
+                max_seq_len,
+                teacher_k,
+                teacher_d,
+                dtype=next(
+                    episode.semantic_teacher_tokens.dtype
+                    for episode in episodes
+                    if episode.semantic_teacher_tokens is not None
+                ),
+            )
+            semantic_teacher_mask = torch.zeros(
+                batch_size, max_seq_len, dtype=torch.bool
+            )
 
         for row, episode in enumerate(episodes):
             if episode.actions.ndim != 1:
@@ -205,6 +236,14 @@ class OfflineDataSource:
             actions[row, :seq_len] = episode.actions[:seq_len].to(dtype=torch.long)
             rewards[row, :seq_len] = episode.rewards[:seq_len].to(dtype=torch.float32)
             env_ids[row] = self.env_id_to_index[episode.env_id]
+            episode_success[row] = 1.0 if episode.metadata.get("success") else 0.0
+            if episode.semantic_teacher_tokens is not None:
+                assert semantic_teacher_tokens is not None
+                assert semantic_teacher_mask is not None
+                semantic_teacher_tokens[row, :seq_len] = (
+                    episode.semantic_teacher_tokens[:seq_len]
+                )
+                semantic_teacher_mask[row, :seq_len] = True
 
         return SequenceBatch(
             obs_tokens=obs_tokens,
@@ -212,6 +251,9 @@ class OfflineDataSource:
             rewards=rewards,
             episode_lengths=episode_lengths,
             env_ids=env_ids,
+            episode_success=episode_success,
+            semantic_teacher_tokens=semantic_teacher_tokens,
+            semantic_teacher_mask=semantic_teacher_mask,
         )
 
 
