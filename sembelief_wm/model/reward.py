@@ -36,11 +36,31 @@ class RewardHead(nn.Module):
         super().__init__()
         self.readout = BeliefReadout.from_config(config, mode=readout_mode)
         D = config.hidden_dim
-        self.net = nn.Sequential(
-            nn.Linear(D, D),
-            nn.GELU(),
-            nn.Linear(D, 1),
-        )
+        head_hidden_dim = config.reward.head_hidden_dim
+        self.head_hidden_dim = head_hidden_dim
+        if head_hidden_dim is None:
+            # Legacy architecture retained for old Phase 1 checkpoints.
+            self.net = nn.Sequential(
+                nn.Linear(D, D),
+                nn.GELU(),
+                nn.Linear(D, 1),
+            )
+            self.compact_net = None
+        elif head_hidden_dim == 0:
+            self.net = None
+            self.compact_net = nn.Linear(D, 1)
+        elif head_hidden_dim > 0:
+            self.net = None
+            self.compact_net = nn.Sequential(
+                nn.Linear(D, head_hidden_dim),
+                nn.GELU(),
+                nn.Linear(head_hidden_dim, 1),
+            )
+        else:
+            raise ValueError(
+                "reward.head_hidden_dim must be None, 0, or a positive integer, "
+                f"got {head_hidden_dim}."
+            )
 
     @property
     def spec(self) -> str:
@@ -48,8 +68,19 @@ class RewardHead(nn.Module):
         return (
             f"RewardHead(readout={self.readout.spec.mode}, "
             f"slots={self.readout.spec.input_slots}, "
-            f"hidden_dim={self.readout.spec.hidden_dim})"
+            f"hidden_dim={self.readout.spec.hidden_dim}, "
+            f"head_hidden_dim={self.head_hidden_dim})"
         )
+
+    def forward_pooled(self, pooled: Tensor) -> Tensor:
+        """Classify already-pooled belief features of shape ``(B, D)``."""
+        if pooled.ndim != 2:
+            raise ValueError(
+                f"forward_pooled expects (B, D), got {tuple(pooled.shape)}."
+            )
+        classifier = self.net if self.net is not None else self.compact_net
+        assert classifier is not None
+        return classifier(pooled).squeeze(-1)
 
     def forward(self, belief: BeliefState | Tensor) -> Tensor:
         """Map belief slots to scalar reward logits.
@@ -61,5 +92,4 @@ class RewardHead(nn.Module):
             reward_logits: `(B,)`
         """
         pooled = self.readout(belief)
-        logits = self.net(pooled)
-        return logits.squeeze(-1)
+        return self.forward_pooled(pooled)
