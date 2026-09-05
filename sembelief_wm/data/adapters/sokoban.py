@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections import deque
 from typing import Any
+import random
 
 import numpy as np
 
@@ -107,6 +108,7 @@ class SokobanEnv:
         max_steps: int = 25,
         seed: int | None = None,
         bfs_max_depth: int = 20,
+        require_real: bool = False,
     ) -> None:
         self.dim_room = dim_room
         self.num_boxes = num_boxes
@@ -127,7 +129,13 @@ class SokobanEnv:
                 max_steps=max_steps,
             )
             self._use_mock = False
-        except Exception:
+        except Exception as exc:
+            if require_real:
+                raise RuntimeError(
+                    "A real gym_sokoban environment is required for this "
+                    "run, but gym_sokoban could not be imported/constructed. "
+                    "Install the locked project dependencies with `uv sync`."
+                ) from exc
             self._use_mock = True
 
     def _get_state_labels(self) -> dict[str, Any]:
@@ -161,7 +169,24 @@ class SokobanEnv:
             return "push"
         return "move"
 
-    def reset(self, *, seed: int | None = None) -> np.ndarray:
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        min_solution_steps: tuple[int, int] | None = None,
+        max_tries: int = 10000,
+    ) -> np.ndarray:
+        """Reset the environment.
+
+        Args:
+            seed: RNG seed for room generation.
+            min_solution_steps: If given, reject levels whose shortest solution
+                length is outside [lo, hi] and retry with a hash-derived seed
+                (mirrors VagenMirror0416's PatchedSokobanEnv.reset filtering,
+                so MBRL eval levels match VagenMirror0416's test set exactly).
+            max_tries: Max retry attempts before giving up and using the last
+                generated level.
+        """
         s = seed if seed is not None else self._seed
         self._step_count = 0
 
@@ -171,9 +196,35 @@ class SokobanEnv:
             rng = np.random.default_rng(s)
             return rng.integers(0, 255, (96, 96, 3), dtype=np.uint8)
 
-        if s is not None:
-            np.random.seed(s)
-        obs = self._env.reset()
+        # VagenMirror0416-compatible generation: seed → generate_room → BFS
+        # shortest solution → if length not in [lo,hi], hash-retry with new seed.
+        cur_seed = s
+        found = min_solution_steps is None
+        for _ in range(max_tries):
+            if cur_seed is not None:
+                # gym_sokoban's generate_room uses BOTH the python `random`
+                # module and np.random. Seed both to make level generation
+                # deterministic (matches VAGEN/VagenMirror set_seed behavior).
+                random.seed(cur_seed)
+                np.random.seed(cur_seed)
+            obs = self._env.reset()
+            if min_solution_steps is None:
+                found = True
+                break
+            state = _extract_sokoban_state(self)
+            if state is not None:
+                player, boxes, targets, walls = state
+                sol = _bfs_solve(player, boxes, targets, walls, self.dim_room, self._bfs_max_depth)
+                sol_len = len(sol) if sol is not None else -1
+                lo, hi = min_solution_steps
+                if lo <= sol_len <= hi:
+                    found = True
+                    break
+            # else: state extraction failed or solution out of range → retry
+            cur_seed = abs(hash(str(cur_seed))) % (2**32) if cur_seed is not None else None
+        if not found:
+            # Use the last generated level even if it didn't satisfy the filter.
+            pass
 
         # Cache state for action_effect computation
         state = _extract_sokoban_state(self)
@@ -186,7 +237,52 @@ class SokobanEnv:
 
         return np.asarray(obs, dtype=np.uint8)
 
-    def get_initial_metadata(self) -> dict[str, Any]:
+    def reset_with_room(self, room_state: np.ndarray, room_fixed: np.ndarray) -> np.ndarray:
+        """Reset to a precomputed layout (skip generate_room entirely).
+
+        Used to load VagenMirror0416's exported test levels so MBRL eval runs on
+        the exact same levels as VagenMirror — bypassing any seed/reset/filter
+        divergence. 100% reproducible.
+
+        Args:
+            room_state: (H, W) int array, gym_sokoban encoding (0=wall, 1=floor,
+                2=target, 3=box-on-target, 4=box, 5=player, 6=player-on-target).
+            room_fixed: (H, W) int array, the fixed walls/targets layout.
+        """
+        self._step_count = 0
+        if self._use_mock or self._env is None:
+            raise RuntimeError(
+                "reset_with_room requires a real gym_sokoban env (got mock). "
+                "Install gym_sokoban into the active environment."
+            )
+        self._env.room_state = np.array(room_state, dtype=np.int64)
+        self._env.room_fixed = np.array(room_fixed, dtype=np.int64)
+        # gym_sokoban uses 5 for player-on-floor and 6 for
+        # player-on-target.  Counterfactual successors can legitimately place
+        # the player on a target, so looking for code 5 alone makes a valid
+        # room appear to contain no player.
+        player_positions = np.argwhere(
+            (self._env.room_state == 5) | (self._env.room_state == 6)
+        )
+        if len(player_positions) != 1:
+            raise ValueError(
+                "reset_with_room expects exactly one player encoded as 5 or 6, "
+                f"found {len(player_positions)}"
+            )
+        self._env.player_position = player_positions[0]
+        self._env.num_env_steps = 0
+        self._env.reward_last = 0
+        self._env.boxes_on_target = 0
+        obs = self._env.render("rgb_array")
+
+        state = _extract_sokoban_state(self)
+        if state is not None:
+            self._prev_player = state[0]
+            self._prev_boxes = state[1]
+        else:
+            self._prev_player = None
+            self._prev_boxes = None
+        return np.asarray(obs, dtype=np.uint8)
         """Get episode-level metadata after reset (initial layout, optimal solution)."""
         room_state = self.room_state
         room_fixed = self.room_fixed
@@ -215,7 +311,17 @@ class SokobanEnv:
             return obs, -0.1, done, {"success": False}
 
         obs, reward, done, info = self._env.step(action)
-        success = bool(done and reward > 1.0)
+        # Structured success judgment (aligned with VAGEN): all boxes on targets.
+        # This is independent of reward magnitude, so it stays correct if the env's
+        # reward shaping changes. gym_sokoban terminates with done=True when boxes
+        # are all on targets, but we check the state explicitly to be robust.
+        state = _extract_sokoban_state(self)
+        if state is not None:
+            _player, boxes, targets, _walls = state
+            success = bool(boxes) and boxes <= targets
+        else:
+            # Fallback for mock/unavailable state: reuse the legacy reward-threshold rule.
+            success = bool(done and reward > 1.0)
         info["success"] = success
 
         # Structured state labels
@@ -451,11 +557,13 @@ class SokobanAdapter:
         num_boxes: int = 1,
         max_steps: int = 25,
         bfs_max_depth: int = 20,
+        require_real: bool = False,
     ) -> None:
         self._dim_room = dim_room
         self._num_boxes = num_boxes
         self._max_steps = max_steps
         self._bfs_max_depth = bfs_max_depth
+        self._require_real = require_real
 
     def make_env(self, seed: int | None = None) -> EnvProtocol:
         return SokobanEnv(
@@ -464,6 +572,7 @@ class SokobanAdapter:
             max_steps=self._max_steps,
             seed=seed,
             bfs_max_depth=self._bfs_max_depth,
+            require_real=self._require_real,
         )
 
     def action_spec(self) -> ActionSpaceSpec:
