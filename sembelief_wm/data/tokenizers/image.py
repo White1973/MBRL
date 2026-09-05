@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...config import Config
-from ...visual_encoder import VJEPATokenCompressor, VisualTokenProjector
+from ...model import VJEPATokenCompressor, VisualTokenProjector
 from ..schema import Observation
 
 
@@ -140,6 +140,25 @@ class ImageTokenizer:
         projected = self._projector(compressed)  # (N, 36, D_model)
         return projected.float()  # (N, 36, D_model) in fp32
 
+    @torch.no_grad()
+    def batch_semantic_teacher_tokens(self, observations: list[Observation]) -> Tensor:
+        """Return frozen compressed V-JEPA features without the WM projector.
+
+        This is intentionally a teacher-only path.  In the Qwen-native world
+        model recipe these `(K, 1408)` features are stored beside the Qwen
+        observation tokens and are never passed to ``posterior_step``.
+        Keeping the features before ``VisualTokenProjector`` avoids making a
+        learned V-JEPA-to-Qwen projection part of the teacher target.
+        """
+        pixel_values = self._preprocess_batch(observations)
+        raw_tokens = self._encode_raw(pixel_values)
+        return self._compressor(raw_tokens).float()
+
+    @torch.no_grad()
+    def semantic_teacher_tokenize(self, obs: Observation) -> Tensor:
+        """Return one frozen compressed V-JEPA feature grid `(K, D_vjepa)`."""
+        return self.batch_semantic_teacher_tokens([obs]).squeeze(0)
+
     @property
     def output_tokens(self) -> int:
         return self._output_tokens
@@ -147,6 +166,10 @@ class ImageTokenizer:
     @property
     def output_dim(self) -> int:
         return self._output_dim
+
+    @property
+    def semantic_teacher_dim(self) -> int:
+        return self._raw_dim
 
     def save_weights(self, path: str) -> None:
         """Save compressor + projector weights for reproducibility."""
