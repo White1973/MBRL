@@ -31,6 +31,13 @@ class EncoderConfig:
     vjepa2_raw_tokens: int = 576
     vjepa2_raw_dim: int = 1408
     compressed_tokens: int = 36         # K_vis after compression
+    # V-JEPA is optional when it is the input encoder, but is explicitly kept
+    # as the frozen semantic teacher in the Qwen-native WM recipe. Teacher
+    # features are compressed raw V-JEPA tokens (no learned projector), so
+    # their dimensionality remains 1408.
+    semantic_teacher_type: Literal["none", "vjepa2"] = "none"
+    semantic_teacher_tokens: int = 36
+    semantic_teacher_dim: int = 1408
 
 
 @dataclass
@@ -59,6 +66,19 @@ class RewardConfig:
     readout: Literal["mean_pool", "attention_pool", "learned_query"] = "mean_pool"
     pos_weight: float = 12.0
     supervision_source: Literal["posterior", "prior", "both"] = "posterior"
+    # Binary reward target threshold.  Reward is labeled positive only when
+    # raw reward > threshold.  Set to 1.0 for Sokoban to ignore small positive
+    # shaping rewards and label only terminal success (+10.9) as positive.
+    success_reward_threshold: float = 0.0
+    # Optional extra BCE on the terminal transition.  Sparse positives are
+    # already handled by ``pos_weight``; keeping this at zero avoids counting
+    # the same successful terminal transition twice with a very large weight.
+    terminal_aux_weight: float = 0.0
+    # Reward classifier capacity. None preserves the legacy D->D->1 MLP.
+    # 0 selects a linear D->1 classifier; a positive value selects a compact
+    # D->hidden->1 MLP. Sparse terminal reward prediction should generally use
+    # 0 or a small bottleneck rather than the legacy multi-million-param head.
+    head_hidden_dim: int | None = None
 
 
 @dataclass
@@ -110,6 +130,76 @@ class TrainingConfig:
     checkpoint_every: int = 1000
     lambda_dynamics: float = 1.0
     lambda_reward: float = 0.1
+    # ``mean`` keeps SIGReg invariant to the number/length of sampled
+    # episodes. ``n_scaled`` preserves the legacy EP*N / variance*N behavior.
+    sigreg_scale_mode: Literal["mean", "n_scaled"] = "mean"
+    # Optional open-loop auxiliaries.  Phase 1 keeps these disabled by
+    # default; Phase-2 alternating refresh explicitly enables them through
+    # ``WorldModelRefreshConfig``.
+    open_dynamics_coef: float = 0.0
+    prior_reward_coef: float = 0.0
+    open_loop_horizon: int = 0
+    open_dynamics_decay: float = 0.9
+    prior_reward_decay: float = 1.0
+    # Action-aware transition auxiliaries.  Absolute belief MSE admits an
+    # identity/average-transition shortcut on slowly changing environments.
+    # Delta cosine supervises the direction of the actual state change, while
+    # inverse-action CE forces logged actions to remain identifiable in both
+    # posterior and prior deltas.
+    delta_cosine_coef: float = 0.0
+    inverse_action_coef: float = 0.0
+    inverse_action_mode: Literal["joint", "prior_frozen"] = "joint"
+    inverse_action_lr: float | None = None
+    delta_min_rms: float = 1e-4
+    # Optional parameter isolation between grounded posterior inference and
+    # action-only prior imagination.  ``lora`` selects a second Qwen adapter
+    # for prior calls; ``residual`` keeps the shared transition frozen and
+    # adds a small action-conditioned correction after the base prior step;
+    # ``state_action`` constrains that correction to the pooled latent change
+    # learned from a fixed PCA state x discrete-action interaction probe.
+    prior_isolation_mode: Literal[
+        "shared", "lora", "residual", "state_action"
+    ] = "shared"
+    prior_lora_adapter_name: str = "wm_prior"
+    # An isolated prior repair keeps every frozen module in eval mode while
+    # still allowing gradients through the selected prior LoRA.  This makes
+    # the released posterior a deterministic target (notably disabling its
+    # frozen LoRA dropout) without changing ordinary Stage-1 training.
+    isolated_prior_repair: bool = False
+    prior_residual_rank: int = 64
+    # Anchor grounded posterior slots to the frozen V-JEPA observation tokens.
+    # The state term preserves observation identity/spatial content; the delta
+    # term specifically preserves action-induced visual change.
+    observation_anchor_coef: float = 0.0
+    observation_delta_anchor_coef: float = 0.0
+    observation_delta_min_rms: float = 1e-4
+    observation_anchor_projection_trainable: bool = True
+    # Frozen V-JEPA spatial-semantic teacher.  Qwen observation tokens enter
+    # the posterior; these losses supervise belief states through a separate
+    # predictor and therefore cannot leak V-JEPA features into the input.
+    # The prior coefficient is the principal future-state constraint. The
+    # posterior term only grounds the Qwen-observed belief; the delta term
+    # compares action-conditioned slotwise changes, never mean-pooled states.
+    vjepa_teacher_prior_coef: float = 0.0
+    vjepa_teacher_posterior_coef: float = 0.0
+    vjepa_teacher_delta_coef: float = 0.0
+    vjepa_teacher_delta_min_rms: float = 1e-4
+    # Fixed slot-aligned visual skip used only by posterior grounding. A
+    # non-zero value makes observation information impossible for the shared
+    # posterior/prior objective to erase from both branches simultaneously.
+    posterior_observation_residual_scale: float = 0.0
+    posterior_grounding_mode: Literal["legacy_residual", "visual_anchor"] = (
+        "legacy_residual"
+    )
+    posterior_recurrent_residual_scale: float = 0.25
+    posterior_action_free: bool = False
+    # Validation safety guard.  A run is stopped only after the configured
+    # number of consecutive validation failures, and an emergency checkpoint
+    # is written first.
+    validation_guard_enabled: bool = False
+    validation_guard_patience: int = 2
+    validation_reward_predicted_positive_max: float = 0.98
+    validation_dynamics_degradation_factor: float = 2.0
     dtype: Literal["bf16", "fp32"] = "bf16"
 
 
@@ -173,20 +263,72 @@ class PPOConfig:
     rollout_source: Literal["imagined", "real_env"] = "imagined"  # where PPO trajectories come from
     rollout_batch_size: int = 32
     rollout_horizon: int = 8
+    # A rollout horizon truncates an imagined fragment; it is not necessarily
+    # an environment terminal.  When enabled, non-terminal leaves bootstrap
+    # from the Critic while genuinely terminated samples still use zero.
+    use_value_bootstrap: bool = False
+    # Keep rollout termination independent from reward shaping.  Until the
+    # prior reward head is calibrated as a per-transition termination model,
+    # fixed-horizon imagination prevents false positives from shrinking an
+    # H-step PPO batch to a single step.
+    imagination_termination_mode: Literal[
+        "fixed_horizon", "predicted_success"
+    ] = "fixed_horizon"
+    # Collect this many detached rollout chunks before one PPO update. This
+    # increases the advantage sample size without increasing Qwen forward
+    # memory for an individual imagined rollout.
+    rollouts_per_update: int = 1
     epochs_per_update: int = 1
     minibatch_size: int = 128
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
+    critic_warmup_min_updates: int = 0
+    critic_warmup_ev_threshold: float = 0.2
+    critic_warmup_ev_patience: int = 3
+    critic_warmup_validation_fraction: float = 0.2
+    critic_warmup_validation_size: int = 256
+    critic_warmup_replay_capacity: int = 4096
+    critic_warmup_train_samples: int = 512
+    critic_warmup_ev_ema_alpha: float = 0.2
+    critic_warmup_mse_improvement: float = 0.05
     weight_decay: float = 0.0
+    recompute_old_log_probs: bool = True
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     kl_coef: float = 0.0               # KL penalty against old policy (0 = disabled)
+    target_kl: float | None = None      # early-stop PPO minibatches above this KL
+    behavior_kl_coef: float = 0.0       # KL(pi || frozen offline-BC policy)
+    behavior_bc_coef: float = 0.0       # expert CE on real posterior beliefs
+    behavior_bc_batch_size: int = 32
+    offline_bc_steps: int = 0           # pre-PPO offline latent BC updates
+    offline_bc_batch_size: int = 32
+    offline_bc_cache_size: int = 2048
+    offline_bc_strategies: tuple[str, ...] = ()
+    offline_bc_lr: float = 1e-4
+    # Compatibility for legacy tokenized Sokoban data/checkpoints trained on
+    # env action ids 1..4. Policy ids stay 0..3; imagined actions are shifted
+    # before the frozen WM, and offline BC labels are shifted back.
+    wm_action_id_offset: int = 0
     max_grad_norm: float = 0.5
     normalize_advantages: bool = True
-    reward_mapping: Literal["sigmoid_affine", "raw_sigmoid", "clipped_logit"] = "raw_sigmoid"  # raw_sigmoid := sigmoid(logit) - 0.5
+    # Entropy floor (anti-collapse); target_entropy=None disables.
+    target_entropy: float | None = None
+    entropy_floor_coef: float = 0.1
+    reward_mapping: Literal[
+        "sigmoid_affine",
+        "raw_sigmoid",
+        "clipped_logit",
+        "terminal_success",
+        "terminal_success_scaled",
+        "terminal_success_conservative",
+        "per_transition_success_conservative",
+    ] = "raw_sigmoid"
+    reward_scale: float = 1.0
+    reward_confidence_floor: float = 0.5
+    reward_low_confidence_scale: float = 0.1
     checkpoint_every: int = 100
     eval_every: int = 50                 # run real-env eval every N updates (0 = disabled)
     eval_episodes: int = 20              # episodes per eval round
@@ -220,6 +362,26 @@ class WorldModelRefreshConfig:
     warmup_steps: int = 100
     grad_clip: float = 1.0
     horizon: int = 8                     # fixed BPTT horizon for WM refresh
+    # Reward optimization is independent from the original Phase-1 settings.
+    # ``None`` preserves the checkpoint/config value; dynamics-only refreshes
+    # set reward_loss_coef=0 and freeze_reward_head=True.
+    reward_pos_weight: float | None = None
+    reward_loss_coef: float | None = None
+    freeze_reward_head: bool = False
+    validation_batches: int = 0         # fixed held-out batches per refresh; 0 disables
+    # Open-loop refresh starts from the grounded posterior at the first
+    # observation in a window, then consumes actions only.  Dynamics gradients
+    # train the WM; prior-reward gradients are stopped at the imagined belief
+    # and train only the reward head.
+    open_dynamics_coef: float = 0.25
+    prior_reward_coef: float = 0.5
+    open_loop_horizon: int = 4
+    open_dynamics_decay: float = 0.9
+    prior_reward_decay: float = 1.0
+    delta_cosine_coef: float = 0.0
+    inverse_action_coef: float = 0.0
+    inverse_action_mode: Literal["joint", "prior_frozen"] = "joint"
+    inverse_action_lr: float | None = None
 
 
 @dataclass
