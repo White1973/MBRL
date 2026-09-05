@@ -54,7 +54,11 @@ def reward_valid_mask_from_window(window: TrainingWindow) -> Tensor:
     return mask
 
 
-def reward_targets_from_window(window: TrainingWindow) -> tuple[Tensor, Tensor]:
+def reward_targets_from_window(
+    window: TrainingWindow,
+    *,
+    threshold: float = 0.0,
+) -> tuple[Tensor, Tensor]:
     """Construct aligned binary reward targets and mask from a training window.
 
     Output contract:
@@ -62,9 +66,9 @@ def reward_targets_from_window(window: TrainingWindow) -> tuple[Tensor, Tensor]:
     - `mask[:, t]` says whether that label is valid
 
     In particular:
-    - `targets[:, 0] = 1[prev_rewards > 0]`
+    - `targets[:, 0] = 1[prev_rewards > threshold]`
     - `mask[:, 0] = has_prev_reward`
-    - for `t >= 1`, `targets[:, t] = 1[rewards[:, t-1] > 0]`
+    - for `t >= 1`, `targets[:, t] = 1[rewards[:, t-1] > threshold]`
     """
 
     if window.prev_rewards.ndim != 1:
@@ -89,11 +93,11 @@ def reward_targets_from_window(window: TrainingWindow) -> tuple[Tensor, Tensor]:
             f"{window.has_prev_reward.shape[0]} vs {batch_size}."
         )
 
-    reward_binary = binary_reward_targets(window.rewards)
+    reward_binary = binary_reward_targets(window.rewards, threshold=threshold)
     targets = torch.zeros_like(window.rewards)
     if horizon > 1:
         targets[:, 1:] = reward_binary[:, :-1]
-    targets[:, 0] = binary_reward_targets(window.prev_rewards)
+    targets[:, 0] = binary_reward_targets(window.prev_rewards, threshold=threshold)
 
     mask = reward_valid_mask_from_window(window)
     return targets, mask
