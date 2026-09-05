@@ -11,6 +11,7 @@ TokenizedEpisodeDataset, SequenceBatch). It does NOT import rl/ or collectors/.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Callable
 
@@ -156,7 +157,21 @@ class MixedDataSampler:
     ) -> None:
         self.offline_source = offline_source
         self.online_buffer = online_buffer
+        if not 0.0 <= online_ratio <= 1.0:
+            raise ValueError(
+                f"online_ratio must be in [0, 1], got {online_ratio}."
+            )
         self.online_ratio = online_ratio
+        self.sampled_online = 0
+        self.sampled_offline = 0
+        self.last_online_count = 0
+        self.last_offline_count = 0
+
+    def _record_mix(self, online: int, offline: int) -> None:
+        self.last_online_count = int(online)
+        self.last_offline_count = int(offline)
+        self.sampled_online += int(online)
+        self.sampled_offline += int(offline)
 
     def sample(self, batch_size: int, config: object) -> SequenceBatch:
         """Sample a mixed batch respecting online_ratio."""
@@ -165,24 +180,160 @@ class MixedDataSampler:
             or self.online_buffer.is_empty
             or self.online_ratio <= 0.0
         ):
+            self._record_mix(0, batch_size)
             return self.offline_source.sample_batch(batch_size)
 
         if self.online_ratio >= 1.0:
+            self._record_mix(batch_size, 0)
             return self.online_buffer.sample_batch(batch_size, config)
 
-        # For batch_size=1, can't split — randomly pick one source
-        if batch_size <= 1:
-            import random
-            if random.random() < self.online_ratio:
-                return self.online_buffer.sample_batch(batch_size, config)
+        online_count = _stochastic_online_count(
+            batch_size, self.online_ratio
+        )
+        if online_count == 0:
+            self._record_mix(0, batch_size)
             return self.offline_source.sample_batch(batch_size)
-
-        online_count = max(1, min(batch_size - 1, round(batch_size * self.online_ratio)))
+        if online_count == batch_size:
+            self._record_mix(batch_size, 0)
+            return self.online_buffer.sample_batch(batch_size, config)
         offline_count = batch_size - online_count
 
         online_batch = self.online_buffer.sample_batch(online_count, config)
         offline_batch = self.offline_source.sample_batch(offline_count)
+        self._record_mix(online_count, offline_count)
         return _concat_sequence_batches(offline_batch, online_batch)
+
+
+class UnifiedRandomReplayPool:
+    """Uniformly sample episodes from one growing offline/online pool.
+
+    Unlike :class:`MixedDataSampler`, this class does not impose a source
+    ratio on each batch.  A deterministic offline subset is fixed once, online
+    episodes are appended by ``OnlineReplayBuffer``, and every draw is uniform
+    over the episodes currently present.  With equal offline and online
+    capacities the expected online fraction therefore grows naturally from
+    zero to one half.
+    """
+
+    def __init__(
+        self,
+        offline_source: OfflineDataSource,
+        online_buffer: OnlineReplayBuffer,
+        *,
+        offline_episodes: int,
+        online_target: int,
+        seed: int = 20260901,
+    ) -> None:
+        if offline_episodes <= 0 or online_target <= 0:
+            raise ValueError("unified replay capacities must be positive")
+        dataset = offline_source.dataset
+        if offline_episodes > len(dataset):
+            raise ValueError(
+                f"requested {offline_episodes} offline replay episodes from "
+                f"a dataset of size {len(dataset)}"
+            )
+        generator = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(len(dataset), generator=generator)[
+            :offline_episodes
+        ].tolist()
+        self.offline_source = offline_source
+        self.online_buffer = online_buffer
+        self.offline_pool = [dataset.episodes[index] for index in indices]
+        self.online_target = int(online_target)
+        self.seed = int(seed)
+        self.sampled_online = 0
+        self.sampled_offline = 0
+        self.last_online_count = 0
+        self.last_offline_count = 0
+        # ``None`` preserves the historical behaviour. Formal PPO sets this
+        # boundary from the resumed Actor-update clock so append-only online
+        # data may safely be ahead of the latest heavyweight checkpoint.
+        self._visible_online_size: int | None = None
+
+    @property
+    def stored_online_size(self) -> int:
+        """Number of physically retained online episodes."""
+        return min(self.online_buffer.size, self.online_target)
+
+    @property
+    def online_size(self) -> int:
+        stored = self.stored_online_size
+        if self._visible_online_size is None:
+            return stored
+        return min(self._visible_online_size, stored)
+
+    def align_online_visibility(
+        self,
+        actor_updates: int,
+        *,
+        require_available: bool,
+    ) -> int:
+        """Expose only replay committed by the Actor checkpoint.
+
+        Extra append-only episodes are retained on disk. As a resumed Actor
+        catches up, they become visible in order and can be reused without
+        collection. If the physical replay is behind the checkpoint,
+        ``require_available=True`` fails instead of silently changing the
+        training distribution.
+        """
+        if actor_updates < 0:
+            raise ValueError("actor_updates must be non-negative")
+        expected = min(int(actor_updates), self.online_target)
+        available = self.stored_online_size
+        if require_available and available < expected:
+            raise RuntimeError(
+                "online replay is behind its Actor checkpoint: "
+                f"available={available}, expected={expected}"
+            )
+        self._visible_online_size = min(expected, available)
+        return self.online_size
+
+    @property
+    def collection_complete(self) -> bool:
+        return self.online_size >= self.online_target
+
+    @property
+    def expected_online_fraction(self) -> float:
+        return self.online_size / (len(self.offline_pool) + self.online_size)
+
+    def sample(self, batch_size: int, config: object) -> SequenceBatch:
+        del config
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        # Visibility follows append order: a checkpoint at Actor N owns
+        # u000001..u00000N, never the newest N episodes from a future run.
+        online_pool = self.online_buffer.episodes[:self.online_size]
+        episodes = self.offline_pool + online_pool
+        indices = torch.randint(0, len(episodes), (batch_size,)).tolist()
+        offline_count = sum(index < len(self.offline_pool) for index in indices)
+        online_count = batch_size - offline_count
+        self.last_offline_count = offline_count
+        self.last_online_count = online_count
+        self.sampled_offline += offline_count
+        self.sampled_online += online_count
+        selected = [episodes[index] for index in indices]
+        return self.offline_source._collate(selected)
+
+
+def _stochastic_online_count(batch_size: int, online_ratio: float) -> int:
+    """Return an unbiased integer online count for a finite batch.
+
+    Deterministic rounding makes ratios below ``1 / batch_size`` impossible:
+    with batch size four, for example, 0.1 used to be forced to 1/4.  Stochastic
+    rounding chooses the adjacent integer counts so the long-run expected
+    fraction remains exactly ``online_ratio``.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+    if not 0.0 <= online_ratio <= 1.0:
+        raise ValueError(
+            f"online_ratio must be in [0, 1], got {online_ratio}."
+        )
+    expected = batch_size * online_ratio
+    lower = math.floor(expected)
+    fractional = expected - lower
+    add_one = fractional > 0.0 and bool(torch.rand(()).item() < fractional)
+    return min(batch_size, lower + int(add_one))
 
 
 def _pad_sequence_batch(batch: SequenceBatch, target_t: int) -> SequenceBatch:
