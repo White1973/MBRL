@@ -26,6 +26,8 @@ class Trajectory:
     values:        (B, H+1) V(s) estimates, last entry is bootstrap value
     mask:          (B, H) optional — 1.0 for valid steps, 0.0 for padding.
                    None means all steps are valid (fixed-horizon, no padding).
+    reward_logits: (B, H) optional raw reward-head logits.  Kept only for
+                   rollout diagnostics; GAE/PPO consume ``rewards``.
     """
 
     states: Tensor
@@ -35,6 +37,13 @@ class Trajectory:
     log_probs: Tensor
     values: Tensor       # (B, H+1) — includes bootstrap value at index H
     mask: Tensor | None = None  # (B, H) — None means all valid
+    reward_logits: Tensor | None = None
+    base_rewards: Tensor | None = None
+    shaping_rewards: Tensor | None = None
+    relative_score_gap: Tensor | None = None
+    relative_top1_top2_margin: Tensor | None = None
+    relative_selected_rank: Tensor | None = None
+    relative_selected_is_top1: Tensor | None = None
 
     @property
     def batch_size(self) -> int:
